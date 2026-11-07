@@ -1,0 +1,12 @@
+{
+    "RamFreePercentWarn":  15,
+    "DiskFreePercentWarn":  10,
+    "DiskFreePercentCritical":  8,
+    "AutoClean":  true,
+    "UnwantedProcesses":  [],
+    "FocusMode":  false,
+    "WebhookUrl":  "",
+    "WebhookType":  "Slack",
+    "AiEnabled":  false,
+    "AiModel":  "qwen2.5:3b"
+}

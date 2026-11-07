@@ -1,0 +1,14 @@
+# Runtime / user-specific data - not part of the app's source
+config.json
+logs/
+Reports/
+DisabledStartupItems/
+.first_run_done
+*.log
+
+# Build output
+dist/
+*.exe
+
+# Local backups
+cortexa-settings-backup_*.json
