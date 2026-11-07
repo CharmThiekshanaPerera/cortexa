@@ -20,6 +20,12 @@ How the app is put together, and the patterns to follow when extending it.
 
 Function definition order mostly doesn't matter for code *inside* event handler scriptblocks (they only execute after the whole script has loaded once), but it does matter for any top-level statement that runs immediately (like the initial-load block, which must come after every function it calls).
 
+## Critical gotcha: module-scoped `$script:` variables aren't visible to the importing script
+
+A `$script:SomeVar` defined inside `PCGuardCore.psm1` lives in the *module's own* script scope — it is private to the module, not exported, and invisible from `PCGuard-GUI.ps1` even though both files are conceptually "the app." Writing `$script:SomeVar` inside the GUI script does **not** read the module's variable; it silently creates/reads a *different*, empty variable in the GUI's own scope. This was found when `$script:AutoApproveEligibleActions` (defined in the module, meant to be the hard-coded enforcement list for auto-approve) was referenced directly from the GUI's command bar handler — the check always evaluated to `$false` because the GUI was reading its own unset variable, not the module's.
+
+**Rule: never reference a module's internal `$script:` variable from the GUI.** If the GUI needs to read a module-internal constant/list, export a small accessor function instead (e.g. `Get-AutoApproveEligibleActions`) and call that. This keeps the single-source-of-truth property (the real list still only exists in one place, in the module) while actually working across the module boundary. If you add a new "hard-coded, not just UI-restricted" safety list in the module, follow this pattern — don't assume `$script:` reaches across `Import-Module`.
+
 ## Critical gotcha: the array-unwrap bug
 
 PowerShell silently collapses a 1-element collection into a bare scalar when it flows through certain expression forms (an `if/else` branch used as an expression, a bare pipeline assigned via `=`, a function's implicit return). WPF's `ItemsSource` then throws `Cannot convert ... to type 'System.Collections.IEnumerable'` because a scalar object isn't enumerable.

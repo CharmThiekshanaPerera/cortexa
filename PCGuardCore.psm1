@@ -188,6 +188,8 @@ function Get-PCGuardConfig {
         WebhookType              = 'Slack'
         AiEnabled                = $false
         AiModel                  = 'qwen2.5:3b'
+        CustomRules              = @()
+        AutoApproveActions       = @()
     }
     if (Test-Path $path) {
         try {
@@ -746,11 +748,121 @@ Rules:
 - End your reply with one line starting exactly with "SUGGESTED_ACTIONS:" followed by a comma-separated list using ONLY these exact tokens, including only the ones that actually apply: FreeRam, CleanTemp, StopUnwanted, SpeedBoost, ShutdownWsl, RestorePoint. If none apply, write "SUGGESTED_ACTIONS: None".
 "@
 
+function Get-AiHistoricalBaseline {
+    # A short "what's normal for this PC" summary from the watchdog's own
+    # logged history, so the AI can say whether today's numbers are actually
+    # unusual rather than judging them in isolation. Returns $null until
+    # there's enough history to be meaningful.
+    param([string]$LogDir, [int]$MinPoints = 3)
+    $points = @(Get-HealthHistory -LogDir $LogDir -MaxPoints 200)
+    if ($points.Count -lt $MinPoints) { return $null }
+
+    $avgRam = [math]::Round(($points | Measure-Object -Property RamFree -Average).Average, 1)
+    $avgCpu = [math]::Round(($points | Measure-Object -Property Cpu -Average).Average, 1)
+    $diskPoints = @($points | Where-Object { $null -ne $_.DiskCFree })
+    $avgDisk = if ($diskPoints.Count -gt 0) { [math]::Round(($diskPoints | Measure-Object -Property DiskCFree -Average).Average, 1) } else { $null }
+
+    $diskText = if ($null -ne $avgDisk) { "Disk C free avg $avgDisk%" } else { "" }
+    "Historical baseline for this PC (last $($points.Count) watchdog scans): RAM free avg $avgRam%, CPU avg $avgCpu%. $diskText"
+}
+
 function Invoke-AiSystemAnalysis {
-    param([string]$Model, [string]$BaseUrl = 'http://localhost:11434')
+    param([string]$Model, [string]$LogDir = $null, [string]$BaseUrl = 'http://localhost:11434')
     $context = Get-AiSystemContext
-    $prompt = "Here is the current system snapshot:`n$context`n`nGive your diagnosis and recommendations."
+    $baseline = if ($LogDir) { Get-AiHistoricalBaseline -LogDir $LogDir } else { $null }
+    $prompt = "Here is the current system snapshot:`n$context"
+    if ($baseline) {
+        $prompt += "`n`n$baseline`n`nCompare today's numbers to this baseline - call out anything that is unusual for THIS specific PC, not just generically high or low."
+    }
+    $prompt += "`n`nGive your diagnosis and recommendations."
     Invoke-OllamaGenerate -Model $Model -Prompt $prompt -SystemPrompt $script:AiSystemPrompt -BaseUrl $BaseUrl -TimeoutSec 60
+}
+
+# Actions eligible for per-action auto-approve, hard-coded independent of
+# anything the UI or config ever sends in - this is the real enforcement
+# point, not just a UI restriction. Deliberately excludes anything that ends
+# a process, stops software, or touches System Restore.
+$script:AutoApproveEligibleActions = @('FreeRam', 'CleanTemp')
+
+function Get-AutoApproveEligibleActions {
+    # Module-internal $script: variables aren't visible across the module
+    # boundary, so the GUI must go through this accessor rather than trying
+    # to read $script:AutoApproveEligibleActions directly - that would
+    # silently resolve to nothing in the importing script's own scope.
+    return $script:AutoApproveEligibleActions
+}
+
+function Invoke-AiParseRule {
+    param([string]$Model, [string]$UserText, [string]$BaseUrl = 'http://localhost:11434')
+    $sys = @"
+You turn a plain-language monitoring request into a structured rule for Cortexa, a PC monitoring app. Cortexa can only watch ONE thing: whether a named process's memory usage exceeds a threshold.
+
+Reply with ONLY one line:
+RULE: process=<process name, no .exe>;thresholdMB=<whole number of megabytes>
+
+Examples:
+"tell me if chrome uses more than 2GB" -> RULE: process=chrome;thresholdMB=2048
+"alert me if spotify goes over 500mb" -> RULE: process=spotify;thresholdMB=500
+
+If the request isn't a process-memory-threshold request (it's about something else, or too vague to extract a process name and a number), reply with exactly: RULE: None
+"@
+    Invoke-OllamaGenerate -Model $Model -Prompt $UserText -SystemPrompt $sys -BaseUrl $BaseUrl -TimeoutSec 30
+}
+
+function Get-AiParsedRule {
+    param([string]$ResponseText)
+    if ($ResponseText -match '(?im)RULE:\s*process=([^;]+);\s*thresholdMB=(\d+)') {
+        $proc = $matches[1].Trim() -replace '\.exe$', ''
+        $threshold = [int]$matches[2]
+        if ($proc -and $threshold -gt 0) {
+            return [PSCustomObject]@{ Process = $proc; ThresholdMB = $threshold }
+        }
+    }
+    return $null
+}
+
+function Add-CustomRule {
+    param([string]$RootDir, [string]$Process, [int]$ThresholdMB)
+    $cfg = Get-PCGuardConfig -RootDir $RootDir
+    $rules = @($cfg.CustomRules)
+    $rules += [PSCustomObject]@{ Id = [guid]::NewGuid().ToString(); Process = $Process; ThresholdMB = $ThresholdMB; Created = (Get-Date).ToString('yyyy-MM-dd HH:mm') }
+    $cfg.CustomRules = $rules
+    Save-PCGuardConfig -RootDir $RootDir -Config $cfg
+    return $rules
+}
+
+function Remove-CustomRule {
+    param([string]$RootDir, [string]$Id)
+    $cfg = Get-PCGuardConfig -RootDir $RootDir
+    $cfg.CustomRules = @($cfg.CustomRules | Where-Object { $_.Id -ne $Id })
+    Save-PCGuardConfig -RootDir $RootDir -Config $cfg
+    return $cfg.CustomRules
+}
+
+function Get-CustomRuleViolations {
+    # Checked by the watchdog each run. Returns one alert line per rule
+    # currently being exceeded (by any single matching process instance).
+    param([object[]]$Rules)
+    $violations = @()
+    foreach ($rule in $Rules) {
+        $procs = @(Get-Process -Name $rule.Process -ErrorAction SilentlyContinue)
+        foreach ($p in $procs) {
+            $memMB = [math]::Round($p.WorkingSet / 1MB, 0)
+            if ($memMB -gt $rule.ThresholdMB) {
+                $violations += "Custom rule: '$($rule.Process)' is using $memMB MB, above your threshold of $($rule.ThresholdMB) MB (PID $($p.Id))."
+                break
+            }
+        }
+    }
+    return $violations
+}
+
+function Invoke-AiExplainAlert {
+    param([string]$Model, [string]$AlertText, [string]$BaseUrl = 'http://localhost:11434')
+    $context = Get-AiSystemContext
+    $prompt = "This alert was logged by Cortexa's background watchdog:`n`n$AlertText`n`nCurrent system snapshot for context:`n$context`n`nIn 2-4 short sentences, explain in plain language why this likely happened and what, specifically, the user should do about it in the Cortexa app."
+    $sys = "You are Cortexa, a PC assistant. Be concise and specific. Reference actual Cortexa features (Free Up RAM, Clean Temp Junk, Speed Boost Now, Disk Analysis tab, Startup tab) where relevant, not generic Windows advice."
+    Invoke-OllamaGenerate -Model $Model -Prompt $prompt -SystemPrompt $sys -BaseUrl $BaseUrl -TimeoutSec 45
 }
 
 function Get-AiSuggestedActions {
@@ -878,9 +990,11 @@ function Invoke-OllamaDeleteModel {
 }
 
 function Invoke-AiChat {
-    param([string]$Model, [string]$UserMessage, [string]$BaseUrl = 'http://localhost:11434')
+    param([string]$Model, [string]$UserMessage, [string]$LogDir = $null, [string]$BaseUrl = 'http://localhost:11434')
     $context = Get-AiSystemContext
+    $baseline = if ($LogDir) { Get-AiHistoricalBaseline -LogDir $LogDir } else { $null }
     $systemPrompt = $script:AiSystemPrompt + "`n`nCurrent system snapshot (for your reference, don't repeat it verbatim unless asked):`n$context"
+    if ($baseline) { $systemPrompt += "`n`n$baseline" }
     Invoke-OllamaGenerate -Model $Model -Prompt $UserMessage -SystemPrompt $systemPrompt -BaseUrl $BaseUrl -TimeoutSec 60
 }
 
@@ -914,4 +1028,4 @@ function Get-AiActionLog {
     return @($parsed | Select-Object -Last $Top | Sort-Object Time -Descending)
 }
 
-Export-ModuleMember -Function Get-SystemHealth, Invoke-SafeCleanup, Test-WatchdogInstalled, Install-Watchdog, Uninstall-Watchdog, Get-RecentAlerts, Get-HealthHistory, Get-TopFolders, Get-WslDockerInfo, Invoke-WslShutdown, Get-PCGuardConfig, Save-PCGuardConfig, Export-HealthReport, Get-NetworkStats, Get-ActiveConnections, Get-NetworkHistory, Get-SystemInfo, Get-DiskIoStats, Get-RecentSystemEvents, Get-ScheduledTasksList, Set-ScheduledTaskState, Get-ProcessesDetailed, Stop-ProcessTree, Set-ProcessPriority, Get-ProcessFilePath, Invoke-FreeUpRam, Invoke-StopUnwantedProcesses, Invoke-CreateRestorePoint, Get-StartupItemsDetailed, Disable-StartupItem, Enable-StartupItem, Get-SecurityStatus, Get-DiskHealth, Get-BatteryHealthReport, Get-LargestFiles, Export-PCGuardSettings, Import-PCGuardSettings, Send-WebhookAlert, Test-OllamaAvailable, Start-OllamaServer, Invoke-OllamaGenerate, Get-AiSystemContext, Invoke-AiSystemAnalysis, Invoke-AiChat, Get-AiSuggestedActions, Invoke-AiExplainProcess, Invoke-AiReviewStartupItems, Invoke-AiParseCommand, Get-AiParsedCommand, Invoke-OllamaPullModel, Invoke-OllamaDeleteModel, Write-AiActionLog, Get-AiActionLog
+Export-ModuleMember -Function Get-SystemHealth, Invoke-SafeCleanup, Test-WatchdogInstalled, Install-Watchdog, Uninstall-Watchdog, Get-RecentAlerts, Get-HealthHistory, Get-TopFolders, Get-WslDockerInfo, Invoke-WslShutdown, Get-PCGuardConfig, Save-PCGuardConfig, Export-HealthReport, Get-NetworkStats, Get-ActiveConnections, Get-NetworkHistory, Get-SystemInfo, Get-DiskIoStats, Get-RecentSystemEvents, Get-ScheduledTasksList, Set-ScheduledTaskState, Get-ProcessesDetailed, Stop-ProcessTree, Set-ProcessPriority, Get-ProcessFilePath, Invoke-FreeUpRam, Invoke-StopUnwantedProcesses, Invoke-CreateRestorePoint, Get-StartupItemsDetailed, Disable-StartupItem, Enable-StartupItem, Get-SecurityStatus, Get-DiskHealth, Get-BatteryHealthReport, Get-LargestFiles, Export-PCGuardSettings, Import-PCGuardSettings, Send-WebhookAlert, Test-OllamaAvailable, Start-OllamaServer, Invoke-OllamaGenerate, Get-AiSystemContext, Invoke-AiSystemAnalysis, Invoke-AiChat, Get-AiSuggestedActions, Invoke-AiExplainProcess, Invoke-AiReviewStartupItems, Invoke-AiParseCommand, Get-AiParsedCommand, Invoke-OllamaPullModel, Invoke-OllamaDeleteModel, Write-AiActionLog, Get-AiActionLog, Get-AiHistoricalBaseline, Invoke-AiExplainAlert, Invoke-AiParseRule, Get-AiParsedRule, Add-CustomRule, Remove-CustomRule, Get-CustomRuleViolations, Get-AutoApproveEligibleActions

@@ -2,6 +2,21 @@
 
 All notable changes to Cortexa, in the order they were built.
 
+## v1.2 — 2026-11-08
+
+### AI Agent — final batch
+- **Comparative analysis**: every analysis and chat response now includes a historical baseline (averages from the watchdog's own logged scans) when enough history exists, so the AI can say whether today's numbers are actually unusual for *this* PC rather than judging them against generic thresholds.
+- **Explain This Alert**: select any entry in Recent Alerts and ask the AI why it likely happened and what to do, with the alert text and live system context.
+- **Plain-language monitoring rules**: describe a threshold in Settings (e.g. "tell me if chrome uses more than 2GB") and the AI turns it into a structured rule the watchdog checks every 15 minutes. Rules are listed and deletable in Settings.
+- **Per-action auto-approve**: optionally skip the confirmation dialog for the command bar's two lowest-risk actions (Free Up RAM, Clean Temp Junk) only — hard-coded eligibility list enforced in the core module, not just a UI toggle; ending a process, stopping software, Speed Boost, and Restore Points always confirm regardless of settings.
+
+### Fixed
+- Command bar parser: the local model drops the required `ACTION:` prefix in a majority of runs (measured ~60% in testing) and just emits the bare token - the parser now falls back to finding a known token anywhere in the response instead of silently failing to "None".
+- `.exe` compatibility: path resolution and UAC self-elevation both assumed running as a `.ps1`, which broke once compiled via ps2exe.
+
+### Release
+- `Cortexa.exe` built and published as a [GitHub Release](https://github.com/CharmThiekshanaPerera/cortexa/releases) (v1.1.0), repo made public, MIT licensed.
+
 ## v1.1 — 2026-11-08
 
 ### AI Agent — agentic features

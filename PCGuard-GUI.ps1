@@ -449,6 +449,12 @@ if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out
                     <StackPanel>
                         <TextBlock Text="RECENT ALERTS" Style="{StaticResource CardHeader}"/>
                         <ListBox x:Name="AlertList" Height="110" ItemTemplate="{StaticResource AlertTemplate}"/>
+                        <WrapPanel Margin="0,8,0,0">
+                            <Button x:Name="BtnExplainAlert" Content="Explain Selected Alert (AI)" Background="#8b5cf6"/>
+                        </WrapPanel>
+                        <Border x:Name="AlertAiPanel" Background="{StaticResource CardAltBrush}" CornerRadius="8" Padding="12" Margin="0,8,0,0" Visibility="Collapsed">
+                            <TextBlock x:Name="AlertAiText" Text="" TextWrapping="Wrap"/>
+                        </Border>
                     </StackPanel>
                 </Border>
 
@@ -970,8 +976,36 @@ if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out
                         <TextBlock Text="AI AGENT" Style="{StaticResource CardHeader}"/>
                         <CheckBox x:Name="CfgAiEnabled" Content="Let the background watchdog run an AI analysis every 15 minutes (logged, not shown as a popup)" Margin="0,4"/>
                         <TextBlock Text="Requires Ollama to be running. Uses whichever model is selected on the AI Agent tab." Style="{StaticResource MutedText}" Margin="0,4,0,0" TextWrapping="Wrap"/>
+
+                        <TextBlock Text="Auto-approve (skip confirmation) for these command-bar actions only:" Margin="0,16,0,4"/>
+                        <TextBlock Text="Restricted to the two lowest-risk, fully reversible actions - ending a process, stopping software, speed boost and restore points always ask first, no matter what." Style="{StaticResource MutedText}" Margin="0,0,0,6" TextWrapping="Wrap"/>
+                        <CheckBox x:Name="ChkAutoApproveFreeRam" Content="Free Up RAM" Margin="0,2"/>
+                        <CheckBox x:Name="ChkAutoApproveCleanTemp" Content="Clean Temp Junk" Margin="0,2"/>
                     </StackPanel>
                 </Border>
+
+                <Border Style="{StaticResource Card}">
+                    <StackPanel>
+                        <TextBlock Text="MONITORING RULES" Style="{StaticResource CardHeader}"/>
+                        <TextBlock Text="Describe a process memory threshold in plain language and the AI will turn it into a rule the background watchdog checks every 15 minutes." Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                        <WrapPanel>
+                            <TextBox x:Name="RuleInput" Width="360" Tag="e.g. tell me if chrome uses more than 2GB" Margin="0,0,8,8"/>
+                            <Button x:Name="BtnAddRule" Content="Add Rule (AI)" Style="{StaticResource PrimaryButton}"/>
+                        </WrapPanel>
+                        <TextBlock x:Name="RuleStatus" Text="" Style="{StaticResource MutedText}" Margin="0,0,0,8"/>
+                        <ListView x:Name="RuleList" Height="120">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="Process" Width="160" DisplayMemberBinding="{Binding Process}"/>
+                                    <GridViewColumn Header="Threshold (MB)" Width="130" DisplayMemberBinding="{Binding ThresholdMB}"/>
+                                    <GridViewColumn Header="Created" Width="150" DisplayMemberBinding="{Binding Created}"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                        <Button x:Name="BtnDeleteRule" Content="Delete Selected Rule" Style="{StaticResource WarningButton}" HorizontalAlignment="Left" Margin="0,8,0,0"/>
+                    </StackPanel>
+                </Border>
+
                 <Border Style="{StaticResource Card}" Margin="0,0,0,4">
                     <StackPanel>
                         <TextBlock Text="OTHER" Style="{StaticResource CardHeader}"/>
@@ -1048,7 +1082,10 @@ foreach ($n in @('RamText','RamBar','CpuText','CpuBar','DiskCText','DiskCBar','D
                  'BtnAiReviewStartup','StartupAiPanel','StartupAiText','AiActionChips',
                  'WelcomeOverlay','BtnWelcomeDismiss','CommandBarInput','BtnCommandBarRun','CommandBarStatus','MainTabControl',
                  'PullModelName','BtnPullModel','BtnDeleteModel','ModelManagerStatus',
-                 'BtnRunAllSteps','BtnAiHistoryRefresh','AiHistoryList')) {
+                 'BtnRunAllSteps','BtnAiHistoryRefresh','AiHistoryList',
+                 'BtnExplainAlert','AlertAiPanel','AlertAiText',
+                 'RuleInput','BtnAddRule','RuleStatus','RuleList','BtnDeleteRule',
+                 'ChkAutoApproveFreeRam','ChkAutoApproveCleanTemp')) {
     Set-Variable -Name $n -Value $window.FindName($n)
 }
 
@@ -1263,6 +1300,26 @@ $BtnSpeedBoost.Add_Click({
     [System.Windows.MessageBox]::Show(($summary -join "`n`n"), "Speed Boost Complete") | Out-Null
     Refresh-Dashboard
     Refresh-ProcessList
+})
+
+$BtnExplainAlert.Add_Click({
+    $sel = $AlertList.SelectedItem
+    if (-not $sel) { [System.Windows.MessageBox]::Show("Select an alert from the list first.", "PCGuard") | Out-Null; return }
+    if (-not $AiModelCombo.SelectedItem) { [System.Windows.MessageBox]::Show("No Ollama model available. Open the AI Agent tab and click Refresh Status (start Ollama first if needed).", "PCGuard") | Out-Null; return }
+    $AlertAiPanel.Visibility = 'Visible'
+    $AlertAiText.Text = "Asking AI about this alert..."
+    $BtnExplainAlert.IsEnabled = $false
+    $modelPath = Join-Path $RootDir 'PCGuardCore.psm1'
+    $model = $AiModelCombo.SelectedItem.ToString()
+    Start-AiJob -ScriptBlock {
+        param($mp, $m, $alertText)
+        Import-Module $mp -Force
+        Invoke-AiExplainAlert -Model $m -AlertText $alertText
+    } -ArgumentList @($modelPath, $model, $sel.ToString()) -OnComplete {
+        param($result)
+        $BtnExplainAlert.IsEnabled = $true
+        $AlertAiText.Text = if ($result.Success) { $result.Response } else { "Could not reach Ollama: $($result.Response)" }
+    }
 })
 
 $BtnRestorePoint.Add_Click({
@@ -2109,14 +2166,28 @@ $BtnCommandBarRun.Add_Click({
             return
         }
         $label = $script:AiActionLabels[$parsed.Action]
-        $confirm = [System.Windows.MessageBox]::Show("Cortexa understood: `"$label`". Run it now?", "Confirm (from command bar)", [System.Windows.MessageBoxButton]::YesNo)
-        if ($confirm -eq 'Yes') {
-            Write-AiActionLog -RootDir $RootDir -Source 'CommandBar' -Action $parsed.Action -Label $label -Decision 'Accepted' -Detail $req
+
+        # Auto-approve only ever applies to the hard-coded safe subset, and
+        # only when the user has explicitly opted in via Settings - this is
+        # the UI-side check; Get-PCGuardConfig/the config itself is the only
+        # source of truth for what's enabled.
+        $autoApproveCfg = Get-PCGuardConfig -RootDir $RootDir
+        $isAutoApproved = ((Get-AutoApproveEligibleActions) -contains $parsed.Action) -and ($autoApproveCfg.AutoApproveActions -contains $parsed.Action)
+
+        if ($isAutoApproved) {
+            Write-AiActionLog -RootDir $RootDir -Source 'CommandBar' -Action $parsed.Action -Label $label -Decision 'AutoApproved' -Detail $req
             $targetButton.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
-            $CommandBarStatus.Text = "Ran: $label"
+            $CommandBarStatus.Text = "Ran (auto-approved): $label"
         } else {
-            Write-AiActionLog -RootDir $RootDir -Source 'CommandBar' -Action $parsed.Action -Label $label -Decision 'Declined' -Detail $req
-            $CommandBarStatus.Text = "Cancelled."
+            $confirm = [System.Windows.MessageBox]::Show("Cortexa understood: `"$label`". Run it now?", "Confirm (from command bar)", [System.Windows.MessageBoxButton]::YesNo)
+            if ($confirm -eq 'Yes') {
+                Write-AiActionLog -RootDir $RootDir -Source 'CommandBar' -Action $parsed.Action -Label $label -Decision 'Accepted' -Detail $req
+                $targetButton.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+                $CommandBarStatus.Text = "Ran: $label"
+            } else {
+                Write-AiActionLog -RootDir $RootDir -Source 'CommandBar' -Action $parsed.Action -Label $label -Decision 'Declined' -Detail $req
+                $CommandBarStatus.Text = "Cancelled."
+            }
         }
         Refresh-AiHistory
     }
@@ -2135,10 +2206,10 @@ $BtnAiAnalyze.Add_Click({
     $modelPath = Join-Path $RootDir 'PCGuardCore.psm1'
     $model = $AiModelCombo.SelectedItem.ToString()
     Start-AiJob -ScriptBlock {
-        param($mp, $m)
+        param($mp, $m, $logDir)
         Import-Module $mp -Force
-        Invoke-AiSystemAnalysis -Model $m
-    } -ArgumentList @($modelPath, $model) -OnComplete {
+        Invoke-AiSystemAnalysis -Model $m -LogDir $logDir
+    } -ArgumentList @($modelPath, $model, $LogDir) -OnComplete {
         param($result)
         $BtnAiAnalyze.IsEnabled = $true
         if ($result.Success) {
@@ -2164,10 +2235,10 @@ $BtnChatSend.Add_Click({
     $modelPath = Join-Path $RootDir 'PCGuardCore.psm1'
     $model = $AiModelCombo.SelectedItem.ToString()
     Start-AiJob -ScriptBlock {
-        param($mp, $m, $userMsg)
+        param($mp, $m, $userMsg, $logDir)
         Import-Module $mp -Force
-        Invoke-AiChat -Model $m -UserMessage $userMsg
-    } -ArgumentList @($modelPath, $model, $msg) -OnComplete {
+        Invoke-AiChat -Model $m -UserMessage $userMsg -LogDir $logDir
+    } -ArgumentList @($modelPath, $model, $msg, $LogDir) -OnComplete {
         param($result)
         $BtnChatSend.IsEnabled = $true
         $script:AiMessages.RemoveAt($script:AiMessages.Count - 1)
@@ -2196,7 +2267,55 @@ function Load-ConfigIntoUI {
     foreach ($item in $CfgWebhookType.Items) { if ($item.Content -eq $cfg.WebhookType) { $CfgWebhookType.SelectedItem = $item } }
     $ChkFocusMode.IsChecked = [bool]$cfg.FocusMode
     $CfgAiEnabled.IsChecked = [bool]$cfg.AiEnabled
+    $ChkAutoApproveFreeRam.IsChecked = $cfg.AutoApproveActions -contains 'FreeRam'
+    $ChkAutoApproveCleanTemp.IsChecked = $cfg.AutoApproveActions -contains 'CleanTemp'
+    Refresh-RuleList
 }
+
+function Refresh-RuleList {
+    $cfg = Get-PCGuardConfig -RootDir $RootDir
+    $RuleList.ItemsSource = $null
+    $RuleList.ItemsSource = @($cfg.CustomRules)
+}
+
+$BtnAddRule.Add_Click({
+    $text = $RuleInput.Text.Trim()
+    if (-not $text) { return }
+    if (-not $AiModelCombo.SelectedItem) { [System.Windows.MessageBox]::Show("No Ollama model available. Open the AI Agent tab and click Refresh Status (start Ollama first if needed).", "PCGuard") | Out-Null; return }
+    $BtnAddRule.IsEnabled = $false
+    $RuleStatus.Text = "Thinking about: `"$text`"..."
+    $modelPath = Join-Path $RootDir 'PCGuardCore.psm1'
+    $model = $AiModelCombo.SelectedItem.ToString()
+    Start-AiJob -ScriptBlock {
+        param($mp, $m, $userText)
+        Import-Module $mp -Force
+        $result = Invoke-AiParseRule -Model $m -UserText $userText
+        if ($result.Success) { Get-AiParsedRule -ResponseText $result.Response } else { $null }
+    } -ArgumentList @($modelPath, $model, $text) -OnComplete {
+        param($parsedRule)
+        $BtnAddRule.IsEnabled = $true
+        if (-not $parsedRule) {
+            $RuleStatus.Text = "Couldn't turn that into a process-memory rule. Try something like `"tell me if chrome uses more than 2GB`"."
+            return
+        }
+        $confirm = [System.Windows.MessageBox]::Show("Add this rule?`n`nAlert when '$($parsedRule.Process)' uses more than $($parsedRule.ThresholdMB) MB of memory.`n`nThe background watchdog checks this every 15 minutes.", "Confirm Monitoring Rule", [System.Windows.MessageBoxButton]::YesNo)
+        if ($confirm -eq 'Yes') {
+            Add-CustomRule -RootDir $RootDir -Process $parsedRule.Process -ThresholdMB $parsedRule.ThresholdMB | Out-Null
+            $RuleInput.Text = ""
+            $RuleStatus.Text = "Rule added."
+            Refresh-RuleList
+        } else {
+            $RuleStatus.Text = "Cancelled."
+        }
+    }
+})
+
+$BtnDeleteRule.Add_Click({
+    $sel = $RuleList.SelectedItem
+    if (-not $sel) { [System.Windows.MessageBox]::Show("Select a rule first.", "PCGuard") | Out-Null; return }
+    Remove-CustomRule -RootDir $RootDir -Id $sel.Id | Out-Null
+    Refresh-RuleList
+})
 
 function Get-UnwantedProcessNames {
     $cfg = Get-PCGuardConfig -RootDir $RootDir
@@ -2217,6 +2336,11 @@ $BtnSaveConfig.Add_Click({
         WebhookType              = ($CfgWebhookType.SelectedItem).Content.ToString()
         AiEnabled                = [bool]$CfgAiEnabled.IsChecked
         AiModel                  = $existing.AiModel
+        CustomRules              = $existing.CustomRules
+        AutoApproveActions       = @(
+            if ($ChkAutoApproveFreeRam.IsChecked) { 'FreeRam' }
+            if ($ChkAutoApproveCleanTemp.IsChecked) { 'CleanTemp' }
+        )
     }
     Save-PCGuardConfig -RootDir $RootDir -Config $cfg
     $ConfigStatusText.Text = "Saved at $(Get-Date -Format 'HH:mm:ss'). The watchdog will use these on its next 15-minute run."

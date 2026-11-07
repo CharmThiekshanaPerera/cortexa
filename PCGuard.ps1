@@ -55,6 +55,11 @@ Write-Log ("NET: sent={0}MB recv={1}MB" -f [math]::Round($net.TotalSentBytes / 1
 
 $alerts = @()
 
+if (@($cfg.CustomRules).Count -gt 0) {
+    $ruleViolations = @(Get-CustomRuleViolations -Rules $cfg.CustomRules)
+    if ($ruleViolations.Count -gt 0) { $alerts += $ruleViolations }
+}
+
 if ($health.RamFreePercent -lt $RamFreePercentWarn) {
     $top = $health.TopProcesses | ForEach-Object { "$($_.Name) ($($_.MemMB) MB)" }
     $alerts += "Low RAM: only $($health.RamFreePercent)% free ($($health.RamFreeGB) GB).`nTop processes: $($top -join ', ')"
@@ -92,7 +97,7 @@ if ($alerts.Count -gt 0) {
 if ($cfg.AiEnabled) {
     $ollama = Test-OllamaAvailable
     if ($ollama.Available) {
-        $ai = Invoke-AiSystemAnalysis -Model $cfg.AiModel
+        $ai = Invoke-AiSystemAnalysis -Model $cfg.AiModel -LogDir $LogDir
         if ($ai.Success) {
             Write-Log ("AI_INSIGHT: " + ($ai.Response -replace "`r?`n", ' '))
         } else {
