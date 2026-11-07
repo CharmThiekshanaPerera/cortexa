@@ -11,7 +11,17 @@ $currentPrincipal = New-Object Security.Principal.WindowsPrincipal ([Security.Pr
 $script:IsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $script:IsAdmin) {
     try {
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs -ErrorAction Stop | Out-Null
+        # Relaunch correctly whether this is running as the raw .ps1 (via
+        # powershell/pwsh) or as a compiled .exe (e.g. via ps2exe) - "powershell
+        # -File $PSCommandPath" only makes sense for the former; a compiled exe
+        # has no .ps1 to point at and must relaunch itself directly.
+        $runningExePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $isCompiledExe = ($runningExePath -match '\.exe$') -and ($runningExePath -notmatch '(?i)\\(powershell|pwsh)\.exe$')
+        if ($isCompiledExe) {
+            Start-Process $runningExePath -Verb RunAs -ErrorAction Stop | Out-Null
+        } else {
+            Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs -ErrorAction Stop | Out-Null
+        }
         exit
     } catch {
         # User declined the UAC prompt - continue running without admin rights.
@@ -20,7 +30,16 @@ if (-not $script:IsAdmin) {
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 
-$RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# $MyInvocation/$PSScriptRoot can resolve incorrectly once this script is
+# compiled to an .exe (e.g. via ps2exe), so fall back to the actual running
+# executable's own location as the final, always-correct source of truth.
+$RootDir = if ($PSScriptRoot) {
+    $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Path) {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+}
 Import-Module (Join-Path $RootDir 'PCGuardCore.psm1') -Force
 $LogDir = Join-Path $RootDir 'logs'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
