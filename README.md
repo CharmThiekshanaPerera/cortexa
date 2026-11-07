@@ -5,10 +5,13 @@ A local Windows system-monitoring and optimization app built in PowerShell + WPF
 ## Launching
 
 - Double-click the **Cortexa** shortcut on the Desktop, or
+- Run `Cortexa.exe` (compiled build — see [Releases](https://github.com/CharmThiekshanaPerera/cortexa/releases)), or
 - Run `PCGuard.bat` in this folder, or
 - Run directly: `powershell -ExecutionPolicy Bypass -File PCGuard-GUI.ps1`
 
 The app requests administrator privileges via a UAC prompt on every launch (needed for ending protected processes, managing scheduled tasks/startup items, Docker/WSL cleanup, and System Restore points). If you decline the prompt, it keeps running at standard privileges with reduced functionality — a badge next to the title shows which mode you're in.
+
+**First run of `Cortexa.exe`:** Windows SmartScreen will likely show "Windows protected your PC" / "Unrecognized app" — this is expected for any unsigned executable from a new publisher, not a sign of a problem. Click **More info → Run anyway**. The `.exe` isn't code-signed (that requires a paid certificate), so this warning will appear once per machine until/unless that changes.
 
 ## What it does
 
